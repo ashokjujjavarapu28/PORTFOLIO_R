@@ -1,32 +1,72 @@
+name: "On PR merged by reviewer → create Issue + trigger Jenkins"
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  issues: write     # to create issues
+  pull-requests: read
+
+jobs:
+  handle-merged-pr:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+    steps:
+
+      - name: Gather PR reviews and decide
+        uses: actions/github-script@v7
+        id: decision
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            // fetch all reviews for PR
+            const reviewsResp = await github.rest.pulls.listReviews({
+              owner, repo, pull_number: pr.number, per_page: 100
+            });
+            const reviews = reviewsResp.data || [];
+
+            // Did any reviewer request changes?
+            const hasChangesRequested = reviews.some(r => (r.state || '').toLowerCase() === 'changes_requested');
+
+            // unique reviewers
+            const reviewers = [...new Set(reviews.map(r => r.user && r.user.login).filter(Boolean))];
+
+            // who merged the PR?
+            const mergedBy = pr.merged_by ? pr.merged_by.login : context.actor;
+
+            // check if merger is one of the reviewers
+            const mergedByIsReviewer = reviewers.includes(mergedBy);
+
+            return {
+              hasChangesRequested,
+              mergedBy,
+              mergedByIsReviewer,
+              reviewers,
+              prNumber: pr.number,
+              prTitle: pr.title,
+              prUrl: pr.html_url
+            };
+
       - name: Act when merged by a reviewer and changes were requested
         if: ${{ fromJson(steps.decision.outputs.result).hasChangesRequested == true && fromJson(steps.decision.outputs.result).mergedByIsReviewer == true }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // optional import
-            const core = (() => { try { return require('@actions/core'); } catch(e){ return null } })();
-
-            // get PR from context
+            const info = JSON.parse(process.env.GITHUB_STEP_SUMMARY || JSON.stringify(${steps.decision.outputs.result})) // fallback
+            // but we can re-read from context for reliability
             const pr = context.payload.pull_request;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-
-            // reconstruct decision result (injected as literal JSON by Actions)
-            const decisionResult = JSON.parse('${{ steps.decision.outputs.result }}');
-
-            // safe merged_by login
-            const mergedByLogin = pr.merged_by ? pr.merged_by.login : context.actor;
-
+            // Build issue title/body
             const title = `Follow-up: PR #${pr.number} — ${pr.title} (merged with prior changes requested)`;
-            const reviewersList = (await github.rest.pulls.listReviews({ owner, repo, pull_number: pr.number })).data
-              .map(r => r.user && '@' + r.user.login).filter(Boolean).join(', ');
-
-            const body = `A PR that had **changes requested** reviews was merged by @${mergedByLogin}.
+            const body = `A PR that had **changes requested** reviews was merged by @${pr.merged_by.login}.
 
 **PR:** ${pr.html_url}
 
-**Reviewers who reviewed this PR:** ${reviewersList}
+**Reviewers who reviewed this PR:** ${ (await github.rest.pulls.listReviews({owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number})).data.map(r => r.user && '@' + r.user.login).filter(Boolean).join(', ') }
 
 **Why this issue is created**
 - The PR previously had one or more "changes requested" reviews; create this issue to track post-merge follow-ups, QA, or backports.
@@ -38,29 +78,26 @@
 
 _This issue was created automatically by a workflow._`;
 
-            // Prevent duplicate: search open issues mentioning this PR URL
-            const q = `repo:${owner}/${repo} in:body "${pr.html_url}" state:open`;
-            const searchRes = await github.rest.search.issuesAndPullRequests({ q });
+            // Prevent duplicate: search open issues that mention this PR URL
+            const searchRes = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} in:body "${pr.html_url}" state:open`
+            });
 
             if (searchRes.data.total_count > 0) {
-              (core && core.info) ? core.info('An open issue referencing this PR already exists — skipping issue creation.') : console.log('An open issue referencing this PR already exists — skipping issue creation.');
+              core.info('An open issue referencing this PR already exists — skipping issue creation.');
             } else {
               const newIssue = await github.rest.issues.create({
-                owner, repo, title, body, labels: ['review-changes','post-merge']
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['review-changes','post-merge']
               });
-              (core && core.info) ? core.info(`Created issue #${newIssue.data.number}`) : console.log(`Created issue #${newIssue.data.number}`);
+              core.info(`Created issue #${newIssue.data.number}`);
             }
 
-            // Trigger Jenkins build
-            let fetchImpl = globalThis.fetch;
-            if (!fetchImpl) {
-              try { fetchImpl = require('node-fetch'); } catch(e) { fetchImpl = null; }
-            }
-            if (!fetchImpl) {
-              (core && core.warning) ? core.warning('No fetch available to trigger Jenkins; skipping Jenkins trigger.') : console.warn('No fetch available to trigger Jenkins; skipping Jenkins trigger.');
-              return;
-            }
-
+            // Trigger Jenkins build via REST API
+            const fetch = require('node-fetch'); // actions/github-script allows require
             const jenkinsUrl = process.env.JENKINS_URL;
             const jenkinsUser = process.env.JENKINS_USER;
             const jenkinsToken = process.env.JENKINS_API_TOKEN;
@@ -68,14 +105,15 @@ _This issue was created automatically by a workflow._`;
             const paramsJson = process.env.JENKINS_BUILD_PARAMS_JSON || '';
 
             if (!jenkinsUrl || !jenkinsUser || !jenkinsToken || !jobName) {
-              (core && core.warning) ? core.warning('Jenkins secrets not set; skipping Jenkins trigger.') : console.warn('Jenkins secrets not set; skipping Jenkins trigger.');
+              core.warning('Jenkins secrets not set; skipping Jenkins trigger.');
               return;
             }
 
+            // Optional: fetch crumb if CSRF is enabled
             const auth = Buffer.from(`${jenkinsUser}:${jenkinsToken}`).toString('base64');
             let crumbHeader = {};
             try {
-              const crumbResp = await fetchImpl(`${jenkinsUrl.replace(/\/+$/,'')}/crumbIssuer/api/json`, {
+              const crumbResp = await fetch(`${jenkinsUrl.replace(/\/+$/,'')}/crumbIssuer/api/json`, {
                 headers: { 'Authorization': `Basic ${auth}` },
               });
               if (crumbResp.ok) {
@@ -83,29 +121,27 @@ _This issue was created automatically by a workflow._`;
                 crumbHeader[crumbData.crumbRequestField] = crumbData.crumb;
               }
             } catch (e) {
-              (core && core.info) ? core.info('Could not fetch Jenkins crumb (maybe CSRF disabled) — continuing.') : console.log('Could not fetch Jenkins crumb (maybe CSRF disabled) — continuing.');
+              core.info('Could not fetch Jenkins crumb (maybe CSRF disabled) — continuing.');
             }
 
+            // Build trigger URL
             const triggerBase = `${jenkinsUrl.replace(/\/+$/,'')}/job/${encodeURIComponent(jobName)}`;
+            // if parameters provided, use buildWithParameters endpoint
             const triggerEndpoint = paramsJson ? `${triggerBase}/buildWithParameters` : `${triggerBase}/build`;
 
+            // Append PR context as parameters if using buildWithParameters
             let triggerUrl = triggerEndpoint;
             if (paramsJson) {
-              let params;
-              try {
-                params = JSON.parse(paramsJson);
-              } catch (e) {
-                (core && core.warning) ? core.warning('Invalid JENKINS_BUILD_PARAMS_JSON; skipping params.') : console.warn('Invalid JENKINS_BUILD_PARAMS_JSON; skipping params.');
-                params = {};
-              }
+              const params = JSON.parse(paramsJson);
+              // append bits for convenience
               params.PR_NUMBER = pr.number;
-              params.PR_MERGED_BY = mergedByLogin;
+              params.PR_MERGED_BY = pr.merged_by.login;
               const qs = new URLSearchParams(params).toString();
               triggerUrl = `${triggerEndpoint}?${qs}`;
             }
 
-            (core && core.info) ? core.info(`Triggering Jenkins: ${triggerUrl}`) : console.log(`Triggering Jenkins: ${triggerUrl}`);
-            const resp = await fetchImpl(triggerUrl, {
+            core.info(`Triggering Jenkins: ${triggerUrl}`);
+            const resp = await fetch(triggerUrl, {
               method: 'POST',
               headers: {
                 'Authorization': `Basic ${auth}`,
@@ -114,10 +150,10 @@ _This issue was created automatically by a workflow._`;
             });
 
             if (resp.ok || resp.status === 201 || resp.status === 200 || resp.status === 302) {
-              (core && core.info) ? core.info('Jenkins build triggered successfully.') : console.log('Jenkins build triggered successfully.');
+              core.info('Jenkins build triggered successfully.');
             } else {
               const text = await resp.text();
-              (core && core.warning) ? core.warning(`Jenkins trigger returned status ${resp.status}: ${text}`) : console.warn(`Jenkins trigger returned status ${resp.status}: ${text}`);
+              core.warning(`Jenkins trigger returned status ${resp.status}: ${text}`);
             }
         env:
           JENKINS_URL: ${{ secrets.JENKINS_URL }}
